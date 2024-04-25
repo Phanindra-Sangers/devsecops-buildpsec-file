@@ -1,0 +1,119 @@
+version: 0.2 
+run-as: root    
+phases:
+  install:
+    # runtime-versions:
+    #   java: openjdk8
+    commands:
+
+      - yum install -y jq
+      - yum install -y unzip
+      - export SONAR_SCANNER_VERSION=4.7.0.2747
+      - export SONAR_SCANNER_HOME=$HOME/.sonar/sonar-scanner-$SONAR_SCANNER_VERSION-linux
+      - curl --create-dirs -sSLo $HOME/.sonar/sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-$SONAR_SCANNER_VERSION-linux.zip
+      - unzip -o $HOME/.sonar/sonar-scanner.zip -d $HOME/.sonar/
+      - export PATH=$SONAR_SCANNER_HOME/bin:$PATH
+      - export SONAR_SCANNER_OPTS="-server"
+      - echo  "Install Phase - using Open JDK 8"
+      - REPOSITORY_URI=264852106485.dkr.ecr.ap-south-1.amazonaws.com/usermanagement-microservice
+
+  pre_build:
+    commands:
+      - echo Logging starting build ...
+      - aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 264852106485.dkr.ecr.ap-south-1.amazonaws.com
+  build:
+    commands:
+      
+      ## SAST Analysis 
+
+      - echo Static Application Security Scan using SonarQube
+      - sonar-scanner -Dsonar.projectKey=devsecops -Dsonar.host.url=http://13.127.68.230:9000 -Dsonar.login=sqp_eb92cf8abe7e783840be646f46d6bd96fefcc75f -Dsonar.exclusions=**/*.java
+    
+      #Quality Gates for Static Application Security Scan(SAST) using Sonarqube
+
+      - sleep 5
+      - |- 
+        quality_status=$(curl -s -u sqp_eb92cf8abe7e783840be646f46d6bd96fefcc75f: http://13.127.68.230:9000/api/qualitygates/project_status?projectKey=devsecops | jq -r '.projectStatus.status')
+        echo "SonarCloud analysistatus is $quality_status"; 
+        if [ $quality_status = "ERROR" ] ; then exit 1;fi
+
+      # HADOLINT Linting the DockerFile
+
+      - echo "DOCKER FILE LINT STATGE"
+      - echo "PRE_BUILD Phase Will fail if Dockerfile is not secure or linted"
+      - echo Using Hadolint for Dockerfile linting
+      - docker pull hadolint/hadolint:v1.16.2
+      - docker run --rm -i -v ${PWD}/.hadolint.yml:/.hadolint.yaml hadolint/hadolint:v1.16.2 hadolint -f json - < ./Dockerfile
+      - echo DOCKER FILE LINT STATGE - PASSED
+
+      # Checkov Linting the Dockerfiles or IAC CODE [ Terraform , CloudFormation ] use in amazon linux 5 standard image doesnt work in amazon coretto 8 
+      # - curl https://bootstrap.pypa.io/get-pip.py | python3
+      # - pip3 install checkov
+      # - checkov --version
+      # - echo Installing Checkov:static code analysis tool for scanning infrastructure as code files for misconfigurations...!! 
+      # - checkov --version
+      # - echo Using Checkov tool for scanning the Dockerfile...
+      # - checkov -f ./Dockerfile
+  
+      # building the code for build file 
+
+      - mvn package
+      - echo "Build phase - mvn package execution completed"
+    
+
+      # Docker Image Building Stage for spring boot application 
+      
+      - echo Build started on `date`
+      - echo Building the usermanagement micro service   Docker image...          
+      - docker build -t $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER .
+
+      # Docker Image scanning ---->  Static Scaning using Anchore Engine 
+
+      -  echo "Deep Vulnerability Scan ANCHORE"
+      - echo "POST_BUILD Phase Will fail if Container fails with Vulnerabilities"
+      - export COMPOSE_INTERACTIVE_NO_CLI=1
+      - curl -s https://ci-tools.anchore.io/inline_scan-v0.6.0 | bash -s -- -r $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER
+      - |
+        jq "{ \"messageType\": \"CodeScanReport\", \"reportType\": \"ANCHORE\", \"createdAt\": $(date +\"%Y-%m-%dT%H:%M:%S.%3NZ\"), \"source_repository\": \"$CODEBUILD_SOURCE_REPO_URL\", \"source_branch\": \"$CODEBUILD_SOURCE_VERSION\", \"build_id\": \"$CODEBUILD_BUILD_ID\", \"source_commitid\": \"$CODEBUILD_RESOLVED_SOURCE_VERSION\", \"report\": . }" anchore-reports/usermanagement-microservice_*-vuln.json > payload.json
+
+      # Docker Image scanning ----> Static Scannig using Trivy Scan
+
+      # - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.18.3
+      # - trivy -f json -o results.json --exit-code 0 --severity HIGH,MEDIUM,LOW --quiet --auto-refresh $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER
+      # - cat results.json
+
+      # Dynamic Application Security testing ------>  DAST  Using OWASP ZAP 
+
+      - yum install java -y 
+      - wget https://github.com/zaproxy/zaproxy/releases/download/v2.11.1/ZAP_2.11.1_Linux.tar.gz
+      - mkdir zap
+      - tar -xvf ZAP_2.11.1_Linux.tar.gz
+      - cd ZAP_2.11.1
+      - ./zap.sh -cmd -quickurl https://minfy.phanindra.tech/usermgmt/health-status -quickprogress -quickout ../zap_report.html 
+
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing the Docker image...
+      - docker push $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER
+      - echo Writing image definitions file...
+      - printf '[{"name":"nginx","imageUri":"%s"}]' $REPOSITORY_URI:$CODEBUILD_BUILD_NUMBER > imagedefinitions.json
+
+artifacts:
+  files: 
+    - 'target/*.jar' 
+    - 'imagedefinitions.json'
+    - '**/*'
+    - zap_report.html
+    
+
+
+
+
+
+CloudShell
+Feedback
+© 2024, Amazon Web Services, Inc. or its affiliates.
+Privacy
+Terms
+Cookie preferences
